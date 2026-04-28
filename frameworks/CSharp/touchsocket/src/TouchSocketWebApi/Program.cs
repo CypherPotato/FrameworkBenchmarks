@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.IO.Pipelines;
 using System.Text;
 using System.Text.Json.Serialization;
 using TouchSocket.Core;
@@ -21,6 +23,24 @@ public class Program
             .SetTransportOption(options =>
             {
                 options.BufferOnDemand = false;
+
+                options.ReceivePipeOptions = new PipeOptions(
+                                pool: MemoryPool<byte>.Shared,
+                                readerScheduler: PipeScheduler.ThreadPool,
+                                writerScheduler: PipeScheduler.ThreadPool,
+                                pauseWriterThreshold: 2 * 1024 * 1024,
+                                resumeWriterThreshold: 1024 * 1024,
+                                minimumSegmentSize: 8192,
+                                useSynchronizationContext: false);
+
+                options.SendPipeOptions = new PipeOptions(
+              pool: MemoryPool<byte>.Shared,
+              readerScheduler: PipeScheduler.ThreadPool,
+              writerScheduler: PipeScheduler.ThreadPool,
+              pauseWriterThreshold: 128 * 1024,
+              resumeWriterThreshold: 64 * 1024,
+              minimumSegmentSize: 8192,
+              useSynchronizationContext: false);
             })
            .ConfigureContainer(a =>
            {

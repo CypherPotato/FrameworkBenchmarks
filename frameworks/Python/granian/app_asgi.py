@@ -35,7 +35,6 @@ async def pg_setup():
 
 SQL_SELECT = 'SELECT "randomnumber", "id" FROM "world" WHERE id = $1'
 SQL_UPDATE = 'UPDATE "world" SET "randomnumber"=$1 WHERE id=$2'
-ROW_ADD = [0, 'Additional fortune added at request time.']
 
 JSON_RESPONSE = {
     'type': 'http.response.start',
@@ -106,7 +105,6 @@ async def route_db(scope, receive, send):
 async def route_queries(scope, receive, send):
     num_queries = get_num_queries(scope)
     row_ids = sample(range(1, 10000), num_queries)
-    worlds = []
 
     async with pool.acquire() as connection:
         rows = await connection.fetchmany(SQL_SELECT, [(v,) for v in row_ids])
@@ -124,7 +122,7 @@ async def route_fortunes(scope, receive, send):
     async with pool.acquire() as connection:
         fortunes = await connection.fetch('SELECT * FROM Fortune')
 
-    fortunes.append(ROW_ADD)
+    fortunes.append([0, 'Additional fortune added at request time.'])
     fortunes.sort(key=key)
     content = template.render(fortunes=fortunes).encode('utf-8')
     await send(HTML_RESPONSE)

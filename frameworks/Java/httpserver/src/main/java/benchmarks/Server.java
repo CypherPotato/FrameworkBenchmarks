@@ -51,19 +51,19 @@ public class Server {
         return fortunes;
     }
 
-    private static DataSource createPostgresDataSource() throws ClassNotFoundException {
+    private static DataSource createPostgresDataSource() {
         HikariConfig config = new HikariConfig();
 
-        config.setJdbcUrl("jdbc:postgresql://tfb-database:5432/hello_world");
+        config.setJdbcUrl("jdbc:postgresql://tfb-database:5432/hello_world?tlsnowait=true");
         config.setUsername("benchmarkdbuser");
         config.setPassword("benchmarkdbpass");
 
-        config.setMaximumPoolSize(64);
-        config.setMinimumIdle(16);
+        config.setMaximumPoolSize(1024);
+        config.setMinimumIdle(0);
 
-        config.setConnectionTimeout(10000);
-        config.setIdleTimeout(600000);
-        config.setMaxLifetime(1800000);
+        config.setConnectionTimeout(1000);
+        config.setIdleTimeout(15000);
+        config.setMaxLifetime(60000);
 
         config.setAutoCommit(true);
 
@@ -88,6 +88,7 @@ public class Server {
             t.getResponseHeaders().add("Server", SERVER_NAME);
             t.sendResponseHeaders(200, HELLO_LENGTH);
             t.getResponseBody().write(HELLO_BYTES);
+            t.getResponseBody().flush();
             t.getResponseBody().close();
         };
     }
@@ -131,6 +132,7 @@ public class Server {
                 t.getResponseHeaders().add("Server", SERVER_NAME);
                 t.sendResponseHeaders(200, bytes.length);
                 t.getResponseBody().write(bytes);
+                t.getResponseBody().flush();
                 t.getResponseBody().close();
             } catch (SQLException | ParseException e) {
                 throw new IOException(e);
@@ -146,13 +148,11 @@ public class Server {
             System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "DEBUG");
         // create server
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 1024 * 8);
-        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.setExecutor(Executors.newCachedThreadPool());
         server.createContext("/plaintext", createPlaintextHandler());
         server.createContext("/json", createJSONHandler());
-        if (settings.contains("postgres")) {
-            DataSource ds = createPostgresDataSource();
-            server.createContext("/fortunes", createFortunesHandler(ds));
-        }
+        DataSource ds = createPostgresDataSource();
+        server.createContext("/fortunes", createFortunesHandler(ds));
         // start server
         server.start();
     }

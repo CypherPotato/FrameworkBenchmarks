@@ -1,113 +1,126 @@
-#[path = "./db_util.rs"]
-mod db_util;
-
-use core::cell::RefCell;
-
-use std::io;
-
-use diesel::prelude::*;
-use diesel_async::{
-    RunQueryDsl,
-    pooled_connection::{AsyncDieselConnectionManager, bb8},
-};
-use futures_util::future::{TryFutureExt, try_join, try_join_all};
-use xitca_postgres_diesel::AsyncPgConnection;
+use diesel::{ExpressionMethods, QueryDsl};
+use futures_util::future::TryJoinAll;
+use xitca_postgres_diesel::{AsyncPgConnection, RunQueryDsl};
 
 use crate::{
-    ser::{Fortune, Fortunes, World},
+    ser::{Fortunes, World},
     util::{DB_URL, HandleResult, Rand},
 };
 
-use db_util::update_query_from_ids;
-
 pub struct Pool {
-    pool: bb8::Pool<AsyncPgConnection>,
-    rng: RefCell<Rand>,
-}
-
-pub async fn create() -> io::Result<Pool> {
-    bb8::Pool::builder()
-        .max_size(1)
-        .min_idle(Some(1))
-        .test_on_check_out(false)
-        .build(AsyncDieselConnectionManager::new(DB_URL))
-        .await
-        .map_err(io::Error::other)
-        .map(|pool| Pool {
-            pool,
-            rng: RefCell::new(Rand::default()),
-        })
+    pool: AsyncPgConnection,
+    rng: core::cell::RefCell<Rand>,
 }
 
 impl Pool {
-    pub async fn get_world(&self) -> HandleResult<World> {
-        {
-            use crate::schema::world::dsl::*;
+    pub async fn create() -> HandleResult<Self> {
+        let pool = AsyncPgConnection::establish(DB_URL).await?;
 
-            let w_id = self.rng.borrow_mut().gen_id();
-            let mut conn = self.pool.get().await?;
-            world.filter(id.eq(w_id)).first(&mut conn).map_err(Into::into)
-        }
-        .await
-    }
-
-    pub async fn get_worlds(&self, num: u16) -> HandleResult<Vec<World>> {
-        try_join_all({
-            use crate::schema::world::dsl::*;
-
-            let mut conn = self.pool.get().await?;
-            let mut rng = self.rng.borrow_mut();
-
-            core::iter::repeat_with(|| {
-                let w_id = rng.gen_id();
-                world.filter(id.eq(w_id)).first(&mut conn).map_err(Into::into)
-            })
-            .take(num as _)
-            .collect::<Vec<_>>()
+        Ok(Self {
+            pool,
+            rng: Default::default(),
         })
-        .await
     }
 
-    pub async fn update(&self, num: u16) -> HandleResult<Vec<World>> {
-        let (get, update) = {
-            use crate::schema::world::dsl::*;
+    pub async fn db(&self) -> HandleResult<World> {
+        use schema::world::dsl::{id, world};
 
-            let mut conn = self.pool.get().await?;
-            let mut rng = self.rng.borrow_mut();
+        let w_id = self.rng.borrow_mut().gen_id();
+        let w = world.filter(id.eq(w_id)).get_result(&self.pool).await?;
+        Ok(w)
+    }
 
-            let (rngs, get) = core::iter::repeat_with(|| {
-                let w_id = rng.gen_id();
-                let rng = rng.gen_id();
+    pub async fn queries(&self, num: u16) -> HandleResult<Vec<World>> {
+        use schema::world::dsl::{id, world};
 
-                let get = world.filter(id.eq(w_id)).first::<World>(&mut conn);
-
-                ((w_id, rng), async move {
-                    let mut w = get.await?;
-                    w.randomnumber = rng;
-                    HandleResult::Ok(w)
-                })
-            })
+        let get = self
+            .rng
+            .borrow_mut()
+            .gen_multi()
             .take(num as _)
-            .collect::<(Vec<_>, Vec<_>)>();
+            .map(|w_id| world.filter(id.eq(w_id)).get_result(&self.pool))
+            .collect::<TryJoinAll<_>>();
 
-            let update = diesel::sql_query(update_query_from_ids(rngs))
-                .execute(&mut conn)
-                .map_err(Into::into);
-
-            (try_join_all(get), update)
-        };
-
-        try_join(get, update).await.map(|(worlds, _)| worlds)
+        get.await.map_err(Into::into)
     }
 
-    pub async fn tell_fortune(&self) -> HandleResult<Fortunes> {
-        {
-            use crate::schema::fortune::dsl::*;
+    pub async fn updates(&self, num: u16) -> HandleResult<Vec<World>> {
+        let mut worlds = self.queries(num).await?;
 
-            let mut conn = self.pool.get().await?;
-            fortune.load(&mut conn).map_err(Into::into)
+        let params = worlds
+            .iter_mut()
+            .zip(self.rng.borrow_mut().gen_multi())
+            .map(|(world, rand)| {
+                world.randomnumber = rand;
+                (world.id, rand)
+            })
+            .collect();
+
+        let sql = update_query_from_ids(params);
+        diesel::sql_query(sql).execute(&self.pool).await?;
+
+        Ok(worlds)
+    }
+
+    pub async fn fortunes(&self) -> HandleResult<Fortunes> {
+        let mut fortunes = Vec::with_capacity(16);
+        schema::fortune::dsl::fortune
+            .load_into(&self.pool, &mut fortunes)
+            .await?;
+        Ok(Fortunes::new(fortunes))
+    }
+}
+
+mod schema {
+    diesel::table! {
+        world (id) {
+            id -> Integer,
+            randomnumber -> Integer,
         }
-        .await
-        .map(Fortunes::new)
     }
+
+    diesel::table! {
+        fortune (id) {
+            id -> Integer,
+            message -> Text,
+        }
+    }
+}
+
+// diesel does not support high level bulk update api. use raw sql to bypass the limitation.
+// relate discussion: https://github.com/diesel-rs/diesel/discussions/2879
+fn update_query_from_ids(mut rngs: Vec<(i32, i32)>) -> String {
+    rngs.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    const PREFIX: &str = "UPDATE world SET randomNumber = w.r FROM (SELECT unnest(ARRAY[";
+    const MID: &str = "]) as i, unnest(ARRAY[";
+    const SUFFIX: &str = "]) as r) w WHERE world.id = w.i";
+
+    let mut query = String::with_capacity(512);
+
+    query.push_str(PREFIX);
+
+    use core::fmt::Write;
+
+    rngs.iter().for_each(|(w_id, _)| {
+        write!(query, "{},", w_id).unwrap();
+    });
+
+    if query.ends_with(',') {
+        query.pop();
+    }
+
+    query.push_str(MID);
+
+    rngs.iter().for_each(|(_, rand)| {
+        write!(query, "{},", rand).unwrap();
+    });
+
+    if query.ends_with(',') {
+        query.pop();
+    }
+
+    query.push_str(SUFFIX);
+
+    query
 }

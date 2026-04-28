@@ -1,72 +1,73 @@
 (ns ring-http-exchange.benchmark
   (:gen-class)
   (:require
-    [jj.majavat :as majavat]
-    [jj.majavat.renderer :refer [->StringRenderer]]
-    [jj.majavat.renderer.sanitizer :refer [->Html]]
-    [jj.sql.boa :as boa]
-    [jsonista.core :as json]
     [next.jdbc.connection :as connection]
-    [ring-http-exchange.core :as server])
+    [ring-http-exchange.input-stream-handler :as input-stream-handler]
+    [ring-http-exchange.core :as server]
+    [ring-http-exchange.string-handler :as string-handler])
   (:import
     (com.zaxxer.hikari HikariDataSource)
-    (java.util.concurrent Executors)))
+    (io.vertx.pgclient PgBuilder PgConnectOptions SslMode)
+    (io.vertx.sqlclient PoolOptions)
+    (java.util.concurrent Executors)
+    (jj.arminio.concurrent ProxyExecutorService)))
 
-(def query-fortunes (boa/execute (boa/->NextJdbcAdapter) "fortune.sql"))
+(def db-spec
+  {:idle-timeout      150000
+   :max-lifetime      300000
+   :minimum-idle      10
+   :maximum-pool-size 1024
+   :dbtype            "postgresql"
+   :host              "tfb-database"
+   :dbname            "hello_world"
+   :username          "benchmarkdbuser"
+   :password          "benchmarkdbpass"})
 
-(def db-spec {:auto-commit        false
-              :connection-timeout 3000
-              :validation-timeout 1000
-              :idle-timeout       300000
-              :max-lifetime       1800000
-              :minimum-idle       128
-              :maximum-pool-size  1024
-              :register-mbeans    false
-              :jdbcUrl            "jdbc:postgresql://tfb-database/hello_world?user=benchmarkdbuser&password=benchmarkdbpass&prepareThreshold=1"})
-
-(def ^:private ^:const additional-message {:id      0
-                                           :message "Additional fortune added at request time."})
-(def ^:private ^:const fortune-headers {"Server"       "ring-http-exchange"
-                                        "Content-Type" "text/html; charset=UTF-8"})
-(def ^:private ^:const json-headers {"Server"       "ring-http-exchange"
-                                     "Content-Type" "application/json"})
-
-(def ^:private render-fortune (majavat/build-renderer "fortune.html"
-                                                      {:renderer (->StringRenderer
-                                                                   {:sanitizer (->Html)})}))
+(def cached-thread-executor (Executors/newCachedThreadPool))
 
 
-(defn- plaintext-response []
-  {:status  200
-   :headers {"Server"       "ring-http-exchange"
-             "Content-Type" "text/plain"}
-   :body    "Hello, World!"})
-
-(defn- get-body [datasource]
-  (let [context (as-> (query-fortunes datasource) fortunes
-                      (conj fortunes additional-message)
-                      (sort-by :message fortunes))]
-    (render-fortune {:messages context})))
+(defn create-vertx-pool []
+  (let [connect-opts (-> (PgConnectOptions.)
+                         (.setHost "tfb-database")
+                         (.setPort 5432)
+                         (.setDatabase "hello_world")
+                         (.setUser "benchmarkdbuser")
+                         (.setPassword "benchmarkdbpass")
+                         (.setSslMode SslMode/DISABLE)
+                         (.setCachePreparedStatements true)
+                         (.setPreparedStatementCacheMaxSize 256))
+        pool-opts (-> (PoolOptions.)
+                      (.setMaxSize 512))]
+    (-> (PgBuilder/pool)
+        (.connectingTo connect-opts)
+        (.with pool-opts)
+        (.build))))
 
 (defn -main
-  [& _]
-  (System/setProperty "jdk.virtualThreadScheduler.parallelism" 
-                    (str (* 4 (.availableProcessors (Runtime/getRuntime)))))
-
+  [& args]
   (println "Starting server on port 8080")
-  (let [datasource (connection/->pool HikariDataSource db-spec)]
-    (server/run-http-server
-      (fn [req]
-        (case (req :uri)
-          "/plaintext" (plaintext-response)
-          "/json" {:status  200
-                   :headers json-headers
-                   :body    (json/write-value-as-bytes {:message "Hello, World!"})}
-          "/fortunes" (let [body (get-body datasource)]
-                        {:status  200
-                         :headers fortune-headers
-                         :body    body})
-          (plaintext-response)))
-      {:port     8080
-       :host     "0.0.0.0"
-       :executor (Executors/newVirtualThreadPerTaskExecutor)})))
+  (let [default-executor-service (ProxyExecutorService. cached-thread-executor)
+        default-server-config {:port              8080
+                               :host              "0.0.0.0"
+                               :lazy-request-map? true
+                               :executor          default-executor-service}
+
+        datasource (connection/->pool HikariDataSource db-spec)
+        use-inputstream? (some #{"--inputstream"} args)
+        async? (some #{"--async"} args)
+        vertx? (some #{"--vertx"} args)
+        ]
+    (.addDataSourceProperty datasource "tcpKeepAlive" "true")
+    (.addDataSourceProperty datasource "useSSL" false)
+    (.addDataSourceProperty datasource "prepStmtCacheSize" "250")
+    (.addDataSourceProperty datasource "cachePrepStmts" "true")
+    (.addDataSourceProperty datasource "prepStmtCacheSqlLimit" "2048")
+
+    (let [handler (cond
+                    vertx? (string-handler/get-vertx-handler (create-vertx-pool))
+                    async? (string-handler/get-async-handler datasource cached-thread-executor)
+                    use-inputstream? (input-stream-handler/get-handler datasource)
+                    :else (string-handler/get-handler datasource))
+          config (cond-> default-server-config
+                         async? (assoc :async? true))]
+      (server/run-http-server handler config))))
